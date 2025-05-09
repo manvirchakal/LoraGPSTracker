@@ -10,7 +10,7 @@ import json
 from typing import Dict, Any
 
 # Logging configuration
-LOG_LEVEL = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+LOG_LEVEL = "DEBUG"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
 LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 # Create a logs directory in the project root
 LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
@@ -30,21 +30,24 @@ SHUTDOWN_TIMEOUT = 5  # seconds to wait during graceful shutdown
 LORA_USING_SPI = True           # Set to True to use SPI instead of UART
 LORA_SPI_BUS = 0                # SPI bus ID
 LORA_SPI_CS = 0                 # Chip select ID (0 for /dev/spidev0.0)
-LORA_RESET_PIN = 18             # Reset pin (GPIO 18)
-LORA_BUSY_PIN = 20              # Busy pin (GPIO 20)
-LORA_DIO1_PIN = 16              # DIO1 pin (GPIO 16)
+LORA_RESET_PIN = 18             # Reset pin (BCM 18)
+LORA_BUSY_PIN = 20              # Busy pin (BCM 20)
+LORA_DIO1_PIN = 16              # DIO1 pin (BCM 16)
 LORA_IRQ_PIN = LORA_DIO1_PIN    # Alias for IRQ pin 
-LORA_TXEN_PIN = 6               # TX enable pin
+LORA_TXEN_PIN = 6               # TX enable pin (BCM 6)
 LORA_RXEN_PIN = -1              # RX enable pin (not used with SX126X)
-LORA_SPI_SPEED = 2000000        # SPI speed in Hz (2 MHz)
+LORA_SPI_SPEED = 1000000        # Reduced SPI speed to 1 MHz for better stability
+LORA_USE_POLLING = True         # Use polling instead of interrupts for Pi Zero 2 W
 
-GPS_PORT = "/dev/ttyAMA0"    # Serial port for GPS module
-GPS_BAUD_RATE = 9600         # Baud rate for GPS module
-GPS_TIMEOUT = 1.0            # Serial timeout for GPS module
-GPS_UPDATE_INTERVAL = 1.0    # How often to update GPS status (seconds)
-GPS_MIN_SATELLITES = 3       # Minimum satellites for a valid fix
-GPS_MIN_HDOP = 5.0           # Maximum HDOP value for a valid fix
-GPS_REQUIRE_3D_FIX = False   # Whether to require a 3D fix
+# GPS configuration for SX1262 HAT
+GPS_ENABLE_PIN = 17             # GPIO pin to enable GPS on SX1262 HAT
+GPS_PORT = "/dev/ttyAMA0"       # Serial port for GPS module
+GPS_BAUD_RATE = 9600           # Baud rate for GPS module
+GPS_TIMEOUT = 1.0              # Serial timeout for GPS module
+GPS_UPDATE_INTERVAL = 1.0      # How often to update GPS status (seconds)
+GPS_MIN_SATELLITES = 3         # Minimum satellites for a valid fix
+GPS_MIN_HDOP = 5.0             # Maximum HDOP value for a valid fix
+GPS_REQUIRE_3D_FIX = False     # Whether to require a 3D fix
 
 # LoRa configuration
 LORA_FREQ = 868.0  # MHz
@@ -56,6 +59,7 @@ LORA_SYNC_WORD = 0x12
 LORA_POWER = 20  # dBm (max 20)
 LORA_CURRENT_LIMIT = 100  # mA
 LORA_CRC = True
+LORA_USE_POLLING = True  # Use polling instead of interrupts for Pi Zero 2 W
 
 # LoRa message configuration
 LORA_CONFIG = {

@@ -12,12 +12,14 @@ import logging
 import threading
 import math
 import re
+import RPi.GPIO as GPIO
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Tuple
 
 from beacon.config import (
     GPS_PORT, GPS_BAUD_RATE, GPS_TIMEOUT, GPS_UPDATE_INTERVAL,
-    GPS_MIN_SATELLITES, GPS_MIN_HDOP, GPS_REQUIRE_3D_FIX
+    GPS_MIN_SATELLITES, GPS_MIN_HDOP, GPS_REQUIRE_3D_FIX,
+    GPS_ENABLE_PIN
 )
 
 # Configure logger
@@ -82,6 +84,12 @@ class GPSModule:
         self.data_lock = threading.Lock()
         self.serial_lock = threading.Lock()
         
+        # Setup GPS enable pin
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(GPS_ENABLE_PIN, GPIO.OUT)
+        GPIO.output(GPS_ENABLE_PIN, GPIO.HIGH)  # Enable GPS
+        logger.info(f"GPS enable pin {GPS_ENABLE_PIN} set HIGH")
+        
         logger.info(f"GPS module initialized on port {port}")
     
     def connect(self) -> bool:
@@ -98,6 +106,8 @@ class GPSModule:
                 baudrate=self.baud_rate,
                 timeout=self.timeout
             )
+            logger.debug(f"Serial port settings: baudrate={self.baud_rate}, timeout={self.timeout}")
+            logger.debug(f"Serial port status: is_open={self.serial.is_open}, in_waiting={self.serial.in_waiting}")
             self.is_connected = True
             logger.info("Connected to GPS module")
             return True
@@ -115,6 +125,10 @@ class GPSModule:
             with self.serial_lock:
                 self.serial.close()
             logger.info("Disconnected from GPS module")
+        
+        # Disable GPS
+        GPIO.output(GPS_ENABLE_PIN, GPIO.LOW)
+        logger.info(f"GPS enable pin {GPS_ENABLE_PIN} set LOW")
         
         self.is_connected = False
     
@@ -321,46 +335,30 @@ class GPSModule:
         return False
     
     def _read_gps_data(self) -> None:
-        """Worker thread for reading and parsing GPS data."""
-        logger.info("GPS reading thread started")
-        
-        # Buffer for NMEA sentences
-        nmea_buffer = ""
-        
+        """Read GPS data from serial port and parse NMEA sentences."""
+        if not self.serial or not self.serial.is_open:
+            logger.error("Serial port not open")
+            return
+            
+        logger.debug("Starting GPS data reading loop")
         while not self.stop_event.is_set():
             try:
-                # Read data from serial port
                 with self.serial_lock:
                     if self.serial.in_waiting:
-                        data = self.serial.read(self.serial.in_waiting).decode('ascii', errors='ignore')
-                        nmea_buffer += data
-                
-                # Process complete NMEA sentences in buffer
-                if '\n' in nmea_buffer:
-                    lines = nmea_buffer.split('\n')
-                    # Last line might be incomplete, keep it for the next iteration
-                    nmea_buffer = lines.pop()
-                    
-                    for line in lines:
-                        line = line.strip()
-                        if line and self._is_valid_nmea(line):
+                        logger.debug(f"Bytes waiting: {self.serial.in_waiting}")
+                        line = self.serial.readline().decode('ascii', errors='ignore').strip()
+                        logger.debug(f"Raw NMEA: {line}")  # Log raw NMEA data
+                        if self._is_valid_nmea(line):
                             self._parse_nmea(line)
-                
-                # Check if it's time to update GPS status
-                current_time = time.time()
-                with self.data_lock:
-                    if (current_time - self.gps_data['last_update']) >= self.update_interval:
-                        self._update_gps_status()
-                        self.gps_data['last_update'] = current_time
-                
-                # Brief delay to avoid consuming too much CPU
-                time.sleep(0.01)
-                
+                    else:
+                        logger.debug("No data waiting on serial port")
+            except serial.SerialException as e:
+                logger.error(f"Serial port error: {e}")
+                time.sleep(1)
             except Exception as e:
                 logger.error(f"Error reading GPS data: {e}")
-                time.sleep(1.0)  # Delay to avoid rapid error loops
-        
-        logger.info("GPS reading thread stopped")
+                time.sleep(1)
+            time.sleep(0.1)  # Small delay to prevent CPU hogging
     
     def _is_valid_nmea(self, sentence: str) -> bool:
         """
@@ -566,27 +564,26 @@ class GPSModule:
                         pass
     
     def _parse_gpgsv(self, parts: List[str]) -> None:
-        """
-        Parse GPGSV sentence (Satellites in View).
-        
-        Args:
-            parts (List[str]): Parts of the NMEA sentence
-        """
-        # GPGSV format:
-        # $GPGSV,total_msgs,msg_num,total_sats,[sat_id,elevation,azimuth,snr,...]*checksum
-        
-        if len(parts) < 4:
-            return
-            
-        # We only care about the total number of satellites in view
-        # This is better provided by GPGGA, but this is a backup
+        """Parse GPGSV sentence (Satellite information)."""
         try:
-            with self.data_lock:
-                total_sats = int(parts[3])
-                if self.gps_data['satellites'] == 0:  # Only update if not set by GPGGA
-                    self.gps_data['satellites'] = total_sats
-        except ValueError:
-            pass
+            if len(parts) < 4:
+                return
+                
+            # Log detailed satellite information
+            total_sats = int(parts[3]) if parts[3] else 0
+            logger.debug(f"Total satellites in view: {total_sats}")
+            
+            # Parse satellite data
+            for i in range(4, len(parts), 4):
+                if i + 3 < len(parts):
+                    sat_id = int(parts[i]) if parts[i] else 0
+                    elevation = float(parts[i+1]) if parts[i+1] else 0
+                    azimuth = float(parts[i+2]) if parts[i+2] else 0
+                    snr = float(parts[i+3]) if parts[i+3] else 0
+                    if sat_id > 0:
+                        logger.debug(f"Satellite {sat_id}: elevation={elevation}°, azimuth={azimuth}°, SNR={snr}dB")
+        except (ValueError, IndexError) as e:
+            logger.error(f"Error parsing GPGSV: {e}")
     
     def _parse_gpgsa(self, parts: List[str]) -> None:
         """
@@ -626,30 +623,46 @@ class GPSModule:
     def _update_gps_status(self) -> None:
         """Update GPS status based on current data."""
         with self.data_lock:
-            # Update validity status
-            self.gps_data['valid'] = self.has_fix()
+            # Check if we have valid position data
+            has_position = (self.gps_data['latitude'] is not None and 
+                          self.gps_data['longitude'] is not None)
             
-            # Log status updates
-            if self.gps_data['valid']:
-                logger.debug(
-                    f"Valid GPS fix: Lat: {self.gps_data['latitude']:.6f}, "
-                    f"Lon: {self.gps_data['longitude']:.6f}, "
-                    f"Alt: {self.gps_data['altitude']:.1f}m, "
-                    f"Sats: {self.gps_data['satellites']}, "
-                    f"HDOP: {self.gps_data['hdop']:.1f}"
-                )
-            else:
-                reason = "Unknown"
-                if self.gps_data['latitude'] is None:
-                    reason = "No position data"
-                elif self.gps_data['satellites'] < self.min_satellites:
-                    reason = f"Too few satellites ({self.gps_data['satellites']}/{self.min_satellites})"
-                elif self.gps_data['hdop'] > self.min_hdop:
-                    reason = f"HDOP too high ({self.gps_data['hdop']:.1f}/{self.min_hdop})"
-                elif self.require_3d_fix and self.gps_data['fix_type'] < 3:
-                    reason = "No 3D fix"
-                    
-                logger.debug(f"No valid GPS fix: {reason}")
+            # Check satellite count
+            has_enough_satellites = self.gps_data['satellites'] >= self.min_satellites
+            
+            # Check HDOP
+            has_good_hdop = self.gps_data['hdop'] <= self.min_hdop
+            
+            # Check 3D fix if required
+            has_3d_fix = not self.require_3d_fix or self.gps_data['fix_type'] == 3
+            
+            # Log detailed status
+            logger.debug(f"GPS Status: Position={has_position}, "
+                        f"Satellites={self.gps_data['satellites']}/{self.min_satellites}, "
+                        f"HDOP={self.gps_data['hdop']:.1f}/{self.min_hdop}, "
+                        f"Fix Type={self.gps_data['fix_type']}, "
+                        f"Fix Quality={self.gps_data['fix_quality']}")
+            
+            # Update valid status
+            self.gps_data['valid'] = (has_position and 
+                                    has_enough_satellites and 
+                                    has_good_hdop and 
+                                    has_3d_fix)
+            
+            # Update timestamp
+            self.gps_data['last_update'] = time.time()
+            
+            if not self.gps_data['valid']:
+                reasons = []
+                if not has_position:
+                    reasons.append("no position")
+                if not has_enough_satellites:
+                    reasons.append(f"insufficient satellites ({self.gps_data['satellites']}/{self.min_satellites})")
+                if not has_good_hdop:
+                    reasons.append(f"poor HDOP ({self.gps_data['hdop']:.1f} > {self.min_hdop})")
+                if not has_3d_fix and self.require_3d_fix:
+                    reasons.append("no 3D fix")
+                logger.debug(f"GPS fix invalid: {', '.join(reasons)}")
                 
     def set_requirements(self, 
                          min_satellites: Optional[int] = None,

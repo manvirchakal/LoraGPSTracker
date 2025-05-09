@@ -22,7 +22,8 @@ from beacon.config import (
     LORA_TX_INTERVAL, LORA_ACK_TIMEOUT, LORA_RETRIES, 
     TRACKER_ID, SERVER_ID, LORA_USING_SPI, 
     LORA_SPI_BUS, LORA_SPI_CS, LORA_RESET_PIN, 
-    LORA_BUSY_PIN, LORA_IRQ_PIN, LORA_TXEN_PIN, LORA_RXEN_PIN
+    LORA_BUSY_PIN, LORA_IRQ_PIN, LORA_TXEN_PIN, LORA_RXEN_PIN,
+    LORA_USE_POLLING
 )
 
 # Add the necessary module path for LoRaRF
@@ -121,6 +122,11 @@ class LoRaModule:
         """Disconnect from the LoRa module."""
         if self.connected:
             self.stop()
+            try:
+                if self.lora:
+                    self.lora.sleep()
+            except Exception as e:
+                logger.error(f"Error during LoRa disconnect: {e}")
             self.lora = None
             self.connected = False
             logger.info("LoRa module disconnected")
@@ -143,7 +149,7 @@ class LoRaModule:
         self.stop_event.clear()
         
         # Start receiver thread
-        self.rx_thread = threading.Thread(target=self._rx_worker, daemon=True)
+        self.rx_thread = threading.Thread(target=self._receive_worker, daemon=True)
         self.rx_thread.start()
         
         # Start transmitter thread
@@ -156,6 +162,13 @@ class LoRaModule:
     def stop(self) -> None:
         """Stop LoRa communication threads."""
         self.stop_event.set()
+        
+        # Set module to sleep mode before stopping threads
+        if self.connected and self.lora:
+            try:
+                self.lora.sleep()
+            except Exception as e:
+                logger.error(f"Error putting LoRa module to sleep: {e}")
         
         if self.rx_thread:
             self.rx_thread.join(timeout=2.0)
@@ -286,46 +299,34 @@ class LoRaModule:
             logger.error(traceback.format_exc())
             return False
             
-    def _rx_worker(self) -> None:
+    def _receive_worker(self) -> None:
         """Worker thread for receiving messages."""
         logger.info("LoRa RX worker started")
         
         while not self.stop_event.is_set():
             try:
-                if not self.connected:
-                    logger.error("Not connected, exiting RX worker")
-                    break
-                    
-                # Request packet receive
-                self.lora.request(self.lora.RX_SINGLE)
-                
-                # Wait for packet or timeout (5 seconds)
-                start_time = time.time()
-                while (time.time() - start_time) < 5 and not self.stop_event.is_set():
-                    if self.lora.available():
+                if LORA_USE_POLLING:
+                    # Use polling mode for receiving
+                    if self.lora.getStatus() == self.lora.STATUS_RX_DONE:
                         # Read the received data
-                        message_data = ""
-                        while self.lora.available():
-                            message_data += chr(self.lora.read())
-                            
-                        # Update stats
-                        self.stats["rx_packets"] += 1
-                        self.stats["rx_bytes"] += len(message_data)
-                        self.stats["last_rssi"] = self.lora.packetRssi()
-                        self.stats["last_snr"] = self.lora.snr()
-                        
-                        logger.debug(f"Received packet, RSSI: {self.stats['last_rssi']} dBm, SNR: {self.stats['last_snr']} dB")
-                        
-                        # Process the packet
-                        self._process_packet(message_data)
-                        break
-                    
-                    time.sleep(0.1)
+                        data = self.lora.read()
+                        if data:
+                            # Process the received data
+                            self._process_received_data(data)
+                    else:
+                        # Start receiving if not already in RX mode
+                        self.lora.setRx(0)  # 0 means continuous receive mode
+                        time.sleep(0.001)  # Small delay to prevent busy waiting
+                else:
+                    # Use interrupt mode for receiving
+                    self.lora.setRx(0)  # 0 means continuous receive mode
+                    self.lora.wait()
                     
             except Exception as e:
-                logger.error(f"Error in RX worker: {e}")
-                self.stats["rx_errors"] += 1
-                time.sleep(1.0)  # Avoid tight loop on error
+                logger.error(f"Error in receive worker: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                time.sleep(1)  # Wait before retrying
                 
         logger.info("LoRa RX worker stopped")
                 
@@ -354,8 +355,23 @@ class LoRaModule:
                         if message.get("ack_req", False):
                             message_id = message["id"]
                             if message_id in self.ack_events:
-                                # Wait for ACK
-                                if not self.wait_for_ack(message_id):
+                                # Wait for ACK using polling
+                                start_time = time.time()
+                                while (time.time() - start_time) < LORA_ACK_TIMEOUT:
+                                    if self.lora.available():
+                                        ack_data = ""
+                                        while self.lora.available():
+                                            ack_data += chr(self.lora.read())
+                                        try:
+                                            ack_msg = json.loads(ack_data)
+                                            if ack_msg.get("type") == "ack" and ack_msg.get("ack_id") == message_id:
+                                                self.ack_events[message_id].set()
+                                                break
+                                        except json.JSONDecodeError:
+                                            pass
+                                    time.sleep(0.01)
+                                    
+                                if not self.ack_events[message_id].is_set():
                                     logger.warning(f"No ACK received for message {message_id}, retry {retries+1}")
                                     success = False
                                     
@@ -417,10 +433,16 @@ class LoRaModule:
             # Begin packet transmission
             self.lora.beginPacket()
             self.lora.write(data_list, len(data_list))
-            self.lora.endPacket()
             
-            # Wait for transmission to complete
-            self.lora.wait()
+            # Use polling mode instead of interrupts
+            if LORA_USE_POLLING:
+                self.lora.setTx(0)  # 0 means transmit until complete
+                # Wait for transmission to complete using polling
+                while self.lora.getStatus() != self.lora.STATUS_TX_DONE:
+                    time.sleep(0.001)  # Small delay to prevent busy waiting
+            else:
+                self.lora.setTx(0)  # 0 means transmit until complete
+                self.lora.wait()
             
             # Update stats
             self.stats["tx_bytes"] += len(payload)
@@ -587,3 +609,27 @@ class LoRaModule:
             logger.error(f"Decryption error: {e}")
             # Return raw data on error
             return data.decode('utf-8', errors='ignore')
+
+    def _process_received_data(self, data: bytes) -> None:
+        """
+        Process received data from the LoRa module.
+        
+        Args:
+            data: Received data as bytes
+        """
+        try:
+            # Update stats
+            self.stats["rx_packets"] += 1
+            self.stats["rx_bytes"] += len(data)
+            self.stats["last_rssi"] = self.lora.packetRssi()
+            self.stats["last_snr"] = self.lora.snr()
+            
+            logger.debug(f"Received packet, RSSI: {self.stats['last_rssi']} dBm, SNR: {self.stats['last_snr']} dB")
+            
+            # Process the received data
+            self._process_packet(data.decode('utf-8'))
+            
+        except Exception as e:
+            logger.error(f"Error processing received data: {e}")
+            self.stats["rx_errors"] += 1
+            time.sleep(1.0)  # Wait before retrying
